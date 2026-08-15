@@ -1,0 +1,162 @@
+{
+  "component-definition": {
+    "uuid": "a3f7c821-4e1b-4d9a-b2f3-9c8e5d6a1b7f",
+    "metadata": {
+      "title": "Acme Health Patient Intake API — GRC Baseline",
+      "last-modified": "2026-08-15T00:00:00Z",
+      "version": "1.0.0",
+      "oscal-version": "1.1.2",
+      "parties": [
+        {
+          "uuid": "b9d2e4f1-7a3c-4b8e-9f2d-1c5a8b3e7d4f",
+          "type": "organization",
+          "name": "Acme Health"
+        }
+      ]
+    },
+    "components": [
+      {
+        "uuid": "c1e8f3b2-5d9a-4c7e-8b1f-2d6a9e4c8b5f",
+        "type": "software",
+        "title": "Patient Intake API",
+        "description": "Serverless patient intake endpoint (AWS Lambda + API Gateway + DynamoDB + S3). Accepts PHI intake submissions, stores them in DynamoDB and S3. Forked from GRCEngClub/cgep-app-starter.",
+        "props": [
+          {
+            "name": "deployment-model",
+            "value": "aws-serverless"
+          },
+          {
+            "name": "primary-framework",
+            "value": "HIPAA Security Rule"
+          }
+        ],
+        "control-implementations": [
+          {
+            "uuid": "d4f7a2c9-8e1b-4d3f-9c7a-5b2e8d1f4c9a",
+            "source": "https://csrc.nist.gov/publications/detail/sp/800-66/rev-2/final",
+            "description": "HIPAA Security Rule controls implemented by the GRC baseline wrapped around the starter application.",
+            "implemented-requirements": [
+              {
+                "uuid": "e7b3c6f1-2d8a-4e9c-b5f2-7a1d4e8c3f6b",
+                "control-id": "hipaa-164.312-a-1",
+                "description": "Access control: unique user identification and minimum necessary access. The starter's IAM policy granting dynamodb:* has been replaced with four scoped actions (PutItem, GetItem, UpdateItem, Query) on the single intake table only.",
+                "props": [
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_iam_role_policy.lambda_dynamo"
+                  },
+                  {
+                    "name": "gap-closed",
+                    "value": "GAP-02"
+                  }
+                ],
+                "links": [
+                  {
+                    "href": "s3://REPLACE_WITH_VAULT_BUCKET/runs/REPLACE_WITH_RUN_ID/evidence-REPLACE_WITH_RUN_ID-REPLACE_WITH_SHA.tar.gz",
+                    "rel": "evidence"
+                  }
+                ]
+              },
+              {
+                "uuid": "f2d8e5b4-9c1a-4f7d-a3e6-8b5c2f9d1a4e",
+                "control-id": "hipaa-164.312-a-2-iv",
+                "description": "Encryption and decryption: PHI at rest encrypted using a customer-managed KMS key (aws_kms_key.phi) with automatic annual rotation enabled. Applied to the starter's S3 uploads bucket and DynamoDB table.",
+                "props": [
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_kms_key.phi"
+                  },
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_s3_bucket_server_side_encryption_configuration.uploads"
+                  },
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_dynamodb_table.intake_encryption"
+                  },
+                  {
+                    "name": "gap-closed",
+                    "value": "GAP-01"
+                  },
+                  {
+                    "name": "gap-closed",
+                    "value": "GAP-03"
+                  }
+                ],
+                "links": [
+                  {
+                    "href": "s3://REPLACE_WITH_VAULT_BUCKET/runs/REPLACE_WITH_RUN_ID/evidence-REPLACE_WITH_RUN_ID-REPLACE_WITH_SHA.tar.gz",
+                    "rel": "evidence"
+                  }
+                ]
+              },
+              {
+                "uuid": "a5c9f1e3-7d2b-4a8f-c6e9-1b4d7f2a5c8e",
+                "control-id": "hipaa-164.312-b",
+                "description": "Audit controls: AWS CloudTrail multi-region trail with log-file validation enabled. Management events logged for all regions. Digest files detect tampering.",
+                "props": [
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_cloudtrail.mgmt"
+                  },
+                  {
+                    "name": "gap-closed",
+                    "value": "GAP-06"
+                  }
+                ],
+                "links": [
+                  {
+                    "href": "s3://REPLACE_WITH_VAULT_BUCKET/runs/REPLACE_WITH_RUN_ID/evidence-REPLACE_WITH_RUN_ID-REPLACE_WITH_SHA.tar.gz",
+                    "rel": "evidence"
+                  }
+                ]
+              },
+              {
+                "uuid": "b8e2d4a6-1f5c-4b9e-d7a2-4c8f1b5e2d9c",
+                "control-id": "hipaa-164.312-c-1",
+                "description": "Integrity: CloudTrail log-file validation produces hourly signed digest files, enabling detection of log alteration or deletion. Evidence vault uses S3 Object Lock COMPLIANCE mode, preventing any object deletion or overwrite before the RetainUntilDate.",
+                "props": [
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_cloudtrail.mgmt (enable_log_file_validation = true)"
+                  },
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_s3_bucket_object_lock_configuration.vault (mode = COMPLIANCE)"
+                  }
+                ],
+                "links": [
+                  {
+                    "href": "s3://REPLACE_WITH_VAULT_BUCKET/runs/REPLACE_WITH_RUN_ID/evidence-REPLACE_WITH_RUN_ID-REPLACE_WITH_SHA.tar.gz",
+                    "rel": "evidence"
+                  }
+                ]
+              },
+              {
+                "uuid": "c3f6b9d1-4a7e-4c2f-e8b5-9d3f6c1b4e7a",
+                "control-id": "hipaa-164.312-e-1",
+                "description": "Transmission security: the starter Lambda ran outside any VPC, making DynamoDB and S3 calls traverse the public internet. A security group (aws_security_group.lambda) with HTTPS-only egress has been provisioned and the function moved into the existing VPC private subnets.",
+                "props": [
+                  {
+                    "name": "terraform-resource",
+                    "value": "aws_security_group.lambda"
+                  },
+                  {
+                    "name": "gap-closed",
+                    "value": "GAP-05"
+                  }
+                ],
+                "links": [
+                  {
+                    "href": "s3://REPLACE_WITH_VAULT_BUCKET/runs/REPLACE_WITH_RUN_ID/evidence-REPLACE_WITH_RUN_ID-REPLACE_WITH_SHA.tar.gz",
+                    "rel": "evidence"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
