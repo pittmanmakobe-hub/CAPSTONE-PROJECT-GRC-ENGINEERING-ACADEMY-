@@ -1,0 +1,178 @@
+name: grc-gate
+
+# The capstone pipeline. Five named steps in order:
+#   1. Plan the Terraform.
+#   2. Policy check with Conftest.
+#   3. Apply on merge to main.
+#   4. Sign the evidence bundle with Cosign (keyless, GitHub OIDC).
+#   5. Upload the signed bundle to the evidence vault.
+#
+# Two PRs must exist in repo history:
+#   - One that passed and merged (green).
+#   - One that failed the policy gate (red) — see docs/trigger-red-pr.md.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # Cosign keyless signing + AWS OIDC
+  contents: read
+
+env:
+  TF_DIR: terraform
+  POLICY_DIR: policies
+
+jobs:
+  grc-gate:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ── Setup ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/cgep-grc-gate
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Install Conftest
+        run: |
+          curl -sSLo conftest.tar.gz \
+            https://github.com/open-policy-agent/conftest/releases/download/v0.53.0/conftest_0.53.0_Linux_x86_64.tar.gz
+          tar xzf conftest.tar.gz conftest
+          sudo mv conftest /usr/local/bin/
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      # ── STEP 1: Plan ─────────────────────────────────────────────────────
+      - name: "Step 1 · Terraform Plan"
+        id: plan
+        run: |
+          mkdir -p evidence
+          cd "$TF_DIR"
+          terraform init -input=false
+
+          # Inject variables from repo vars; adjust for your actual var names.
+          terraform plan -input=false -out=tfplan.bin \
+            -var="starter_uploads_bucket=${{ vars.STARTER_UPLOADS_BUCKET }}" \
+            -var="starter_dynamodb_table=${{ vars.STARTER_DYNAMODB_TABLE }}" \
+            -var="starter_lambda_name=${{ vars.STARTER_LAMBDA_NAME }}" \
+            -var="starter_vpc_id=${{ vars.STARTER_VPC_ID }}" \
+            -var="starter_private_subnet_ids=[\"${{ vars.STARTER_SUBNET_IDS }}\"]"
+
+          terraform show -json tfplan.bin > ../evidence/plan.json
+          cp tfplan.bin ../evidence/
+
+      # ── STEP 2: Policy Check ──────────────────────────────────────────────
+      - name: "Step 2 · Policy Check (Conftest + OPA)"
+        id: policy
+        # Run always so the evidence bundle captures even failing policy results.
+        if: always() && steps.plan.outcome == 'success'
+        run: |
+          set +e
+          conftest test evidence/plan.json \
+            --policy "$POLICY_DIR" \
+            --output json \
+            > evidence/policy-results.json 2>&1
+          POLICY_EXIT=$?
+          set -e
+
+          cat evidence/policy-results.json
+          echo "policy_exit=${POLICY_EXIT}" >> "$GITHUB_OUTPUT"
+          # Do not exit here — preserve the exit code for the gate step below.
+          exit $POLICY_EXIT
+
+      # ── STEP 3: Apply (merge to main only) ───────────────────────────────
+      - name: "Step 3 · Terraform Apply"
+        id: apply
+        # Only on push to main (after PR merged), and only if policy passed.
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.policy.outcome == 'success'
+        run: |
+          cd "$TF_DIR"
+          terraform apply -auto-approve -input=false \
+            -var="starter_uploads_bucket=${{ vars.STARTER_UPLOADS_BUCKET }}" \
+            -var="starter_dynamodb_table=${{ vars.STARTER_DYNAMODB_TABLE }}" \
+            -var="starter_lambda_name=${{ vars.STARTER_LAMBDA_NAME }}" \
+            -var="starter_vpc_id=${{ vars.STARTER_VPC_ID }}" \
+            -var="starter_private_subnet_ids=[\"${{ vars.STARTER_SUBNET_IDS }}\"]"
+
+      # ── STEP 4 & 5: Sign + Upload Evidence ───────────────────────────────
+      # Runs always — we want signed evidence even when the gate fails so the
+      # audit trail is never missing a run. The gate pass/fail decision is
+      # made by the final step below, not here.
+      - name: "Step 4 & 5 · Bundle + Sign (Cosign) + Upload to Vault"
+        id: sign_and_upload
+        if: always() && steps.plan.outcome != 'skipped'
+        env:
+          VAULT: ${{ vars.EVIDENCE_VAULT }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # Collect extra evidence artifacts
+          cp "$POLICY_DIR"/*.rego evidence/ 2>/dev/null || true
+          echo "{\"run_id\":\"${RUN_ID}\",\"sha\":\"${SHA}\",\"ref\":\"${GITHUB_REF}\",\"event\":\"${GITHUB_EVENT_NAME}\",\"policy_outcome\":\"${{ steps.policy.outcome }}\"}" \
+            > evidence/run-metadata.json
+
+          # Bundle
+          BUNDLE="evidence-${RUN_ID}-${SHA}.tar.gz"
+          tar czf "${BUNDLE}" evidence/
+          shasum -a 256 "${BUNDLE}" | awk '{print $1}' > "${BUNDLE}.sha256"
+
+          # Sign (keyless via GitHub OIDC → Sigstore Fulcio + Rekor)
+          cosign sign-blob --yes --bundle "${BUNDLE}.sig.bundle" "${BUNDLE}"
+
+          # Upload all three artifacts + receipt
+          KEY_PREFIX="runs/${RUN_ID}"
+          aws s3 cp "${BUNDLE}"            "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}.sha256"     "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sha256"
+          aws s3 cp "${BUNDLE}.sig.bundle" "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sig.bundle"
+
+          VERSION_ID=$(aws s3api head-object \
+            --bucket "${VAULT}" \
+            --key "${KEY_PREFIX}/${BUNDLE}" \
+            --query VersionId --output text)
+
+          cat > receipt.json <<EOF
+          {
+            "run_id":       "${RUN_ID}",
+            "vault":        "${VAULT}",
+            "bundle_key":   "${KEY_PREFIX}/${BUNDLE}",
+            "version_id":   "${VERSION_ID}",
+            "sha256":       "$(cat ${BUNDLE}.sha256)",
+            "commit":       "${SHA}",
+            "policy_gate":  "${{ steps.policy.outcome }}"
+          }
+          EOF
+          aws s3 cp receipt.json "s3://${VAULT}/${KEY_PREFIX}/receipt.json"
+
+          echo "Signed bundle uploaded to s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+
+      # ── GATE: Enforce pass/fail decision last ─────────────────────────────
+      # Moved to the final step so signing always runs first.
+      - name: "Enforce Policy Gate"
+        if: always()
+        run: |
+          if [ "${{ steps.policy.outcome }}" == "failure" ]; then
+            echo "GATE FAILED: Policy check did not pass. Evidence has been preserved in the vault."
+            exit 1
+          fi
+          if [ "${{ steps.policy.outcome }}" == "skipped" ]; then
+            echo "GATE SKIPPED: Plan step did not succeed; policy check was not run."
+            exit 1
+          fi
+          echo "GATE PASSED: All HIPAA policy controls satisfied."
