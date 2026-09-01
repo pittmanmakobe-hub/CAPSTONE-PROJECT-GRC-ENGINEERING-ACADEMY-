@@ -40,3 +40,4 @@ variable "starter_vpc_id" {
 variable "starter_private_subnet_ids" {
   description = "Private subnet IDs inside the starter VPC for the Lambda VPC config."
   type        = list(string)
+}
